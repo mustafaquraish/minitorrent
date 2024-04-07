@@ -1,0 +1,537 @@
+import std::fs
+import std::bencode
+import std::hash::sha1::{ SHA1Hash }
+import std::buffer::{ Buffer, BytesReader }
+import std::curl
+import std::socket::{ Socket }
+import std::vector::{ Vector }
+import std::set::{ Set }
+import std::sv::{ SV }
+import std::libc::memcpy
+
+const CHUNK_SIZE: u32 = 16 * 1024
+
+enum MessageType extern("u8") {
+    Choke = extern("0")
+    Unchoke = extern("1")
+    Interested = extern("2")
+    NotInterested = extern("3")
+    Have = extern("4")
+    Bitfield = extern("5")
+    Request = extern("6")
+    Piece = extern("7")
+    Cancel = extern("8")
+}
+
+struct Torrent {
+    file_name: str
+    announce: str
+
+    file_size: i64
+    piece_size: i64
+    num_pieces: u32
+
+    info_hash: SHA1Hash
+    piece_hashes: &Vector<SHA1Hash>
+}
+
+struct Message {
+    type: MessageType
+    payload: Buffer
+}
+
+def Message::free(&this) => .payload.free()
+
+def Message::make(type: MessageType): Message => Message(
+    type: type,
+    payload: Buffer::from_sized_str(``, 0)
+)
+
+struct Chunk {
+    index: u32
+    offset: u32
+    data: SV      // This is just a view into the buffer
+}
+
+def Chunk::make(payload: &Buffer): Chunk {
+    let io = payload.reader()
+    let index = io.read_u32()
+    let offset = io.read_u32()
+    let length = payload.size - 8
+    let data = io.read_bytes_sv(length)
+    return Chunk(index, offset, data)
+}
+
+struct Peer {
+    torrent: &Torrent
+    socket: Socket
+
+    pieces_available: &Vector<u32>
+    downloaded_pieces: &Set<u32>
+    is_choked: bool
+
+    file: &fs::File
+}
+
+def Peer::make(torrent: &Torrent, socket: Socket): Peer {
+    return Peer(
+        torrent: torrent,
+        socket: socket,
+        pieces_available: Vector<u32>::new(),
+        downloaded_pieces: Set<u32>::new(),
+        is_choked: true,
+        file: null
+    )
+}
+
+def parse_torrent_file(filename: str): Torrent {
+    let contents = fs::read_file(filename)
+    defer contents.free()
+
+    let data = bencode::parse(contents)
+    defer data.free()
+
+    // println(f"[+] Parsed torrent file: {data.dbg()}")
+
+    let torrent: Torrent
+
+    torrent.announce = data.get("announce").as_str().new_str()
+    println(f"[+] Announce URL: {torrent.announce}")
+
+    let info = data.get("info")
+
+    if not info.contains("length") {
+        println("[-] Multi-file torrent, not supported. Files:")
+        let files = info.get("files").as_list()
+        for file : files.iter() {
+            let path = file.get("path").as_list()
+            assert path.size == 1
+
+            let file_name = path.at(0).as_str()
+            let size = file.get("length").as_int()
+            println(f"  => ({size}) {file_name}")
+        }
+
+        let first_file = files.at(0)
+        torrent.file_size = first_file.get("length").as_int()
+        torrent.file_name = first_file.get("path").at(0).as_str().new_str()
+
+    } else {
+        torrent.file_name = info.get("name").as_str().new_str()
+        torrent.file_size = info.get("length").as_int()
+        println(f"[+] Name: {torrent.file_name}")
+    }
+
+
+    torrent.piece_size = info.get("piece length").as_int()
+
+    let pieces = info.get("pieces").as_str()
+    let piece_hashes = Vector<SHA1Hash>::new()
+    for let i = 0; i < pieces.size; i += 20 {
+        let hash: SHA1Hash
+        memcpy(dest: hash.data, src: pieces.data + i, 20)
+        piece_hashes.push(hash)
+    }
+    torrent.piece_hashes = piece_hashes
+    torrent.num_pieces = piece_hashes.size
+
+    let info_bencode = bencode::serialize(data.get("info"))
+    defer info_bencode.free()
+    torrent.info_hash = SHA1Hash::from(info_bencode)
+
+    return torrent
+}
+
+def url_encode_into_buffer(out: &Buffer, data: &u8, size: u32) {
+    for let i = 0; i < size; i++ {
+        out <<= f"%{data[i]:02x}"
+    }
+}
+
+def Peer::perform_handshake(&this) {
+    let message = Buffer::make()
+    defer message.free()
+
+    message.write_i8(19)
+    message.write_bytes("BitTorrent protocol", 19)
+    message.write_u64(0)
+    message.write_bytes(.torrent.info_hash.data, 20)
+    message.write_bytes("12345678901234567890", 20)
+
+    .socket.write(&message)
+
+    let response = Buffer::make()
+    defer response.free()
+
+    .socket.read(&response, message.size)
+    let response_sv = response.sv()
+    let remote_peer_id = response_sv.slice(response_sv.len - 20, response_sv.len)
+
+    print("[+] Connected to Remote peer ID: ")
+    for let i = 0; i < 20; i++ {
+        print(f"{remote_peer_id.data[i] as u8:02x}")
+    }
+    println("")
+}
+
+def Peer::send_message(&this, message: Message) {
+    let data = Buffer::make()
+    defer data.free()
+
+    data.write_u32(1 + message.payload.size)
+    data.write_u8(message.type as u8)
+    if message.payload.size > 0 {
+        data.write_bytes(message.payload.data, message.payload.size)
+    }
+    .socket.write(&data)
+}
+
+def Peer::get_message(&this): Message {
+    let header = Buffer::make()
+    defer header.free()
+    .socket.read_exactly(&header, 5)
+
+    let header_io = header.reader()
+    let size = header_io.read_u32()
+    let type = header_io.read_u8() as MessageType
+
+    let payload = Buffer::make()
+    .socket.read_exactly(&payload, size - 1)
+    let msg = Message(type, payload)
+
+    match msg.type {
+        Have => {
+            let io = msg.payload.reader()
+            let piece_index = io.read_u32()
+            if not .downloaded_pieces.contains(piece_index) {
+                .pieces_available.push(piece_index)
+            }
+        }
+        Bitfield => {
+            let off = 0
+            for let i = 0; i < msg.payload.size; i++ {
+                let byte = msg.payload.data[i]
+                for let j = 0u8; j < 8; j++ {
+                    let bit_idx = 8u8 - j - 1
+                    if (byte >> bit_idx) & 1 == 1 {
+                        if not .downloaded_pieces.contains(off + j as u32) {
+                            .pieces_available.push(off + j as u32)
+                        }
+                    }
+                }
+                off += 8
+            }
+        }
+        Unchoke => {
+            if .is_choked {
+                println("[+] Got Unchoke message!")
+            }
+            .is_choked = false
+        }
+        Choke => {
+            if not .is_choked {
+                println("[+] Got Choke message :(")
+            }
+            .is_choked = true
+        }
+        else => {}
+    }
+
+    return msg
+}
+
+def connect_to_first_peer_tcp(torrent: &Torrent): Peer {
+    // First, make request to the tracker
+    let url = Buffer::make()
+    defer url.free()
+
+    url += torrent.announce
+    url += "?info_hash="
+    url_encode_into_buffer(&url, torrent.info_hash.data, 20)
+    url += "&peer_id=12345678901234567890"   // Random peer ID
+    url += "&port=6881"
+    url += "&uploaded=0"
+    url += "&downloaded=0"
+    url <<= `&left={torrent.file_size}`
+    url += "&compact=1"
+
+    println(f"[+] Connecting to tracker: {url.str()}")
+    let response = curl::http_request(url.str())
+    defer response.free()
+
+    println(f"[+] Tracker Response size: {response.size}")
+    let data = bencode::parse(response)
+    defer data.free()
+
+    println(f"[+] Tracker Response: {data.dbg()}")
+
+    let err = data.get("failure reason")
+    if err? {
+        let msg = err.as_str()
+        println(f"[-] Tracker Error: '{msg}'")
+        std::exit(1)
+    }
+
+    let peers = data.get("peers").as_str().sv()
+
+    println(f"[+] Found {peers.len / 6} Peers")
+    let sock: Socket
+    let found_peer = false
+    for let i = 0; i < peers.len; i += 6 {
+        let ip = peers.slice(i+0, i+4)
+        let peer_port = peers.slice(i+4, i+6)
+        let port_number = (peer_port.data[0] as u8 as u32 << 8) + peer_port.data[1] as u8 as u32
+
+        if not found_peer {
+            let peer_ip = f"{ip.data[0] as u8}.{ip.data[1] as u8}.{ip.data[2] as u8}.{ip.data[3] as u8}"
+            let peer_port = port_number
+            print(f"[+] Trying to connect to peer: {peer_ip}:{peer_port} ... ")
+            let res = Socket::try_connect(peer_ip, peer_port as i32, TCP, &sock, timeout_secs: 1)
+            if res == Ok {
+                println("Connected!")
+                found_peer = true
+            } else {
+                println("Failed.")
+                continue
+            }
+        }
+    }
+
+    return Peer::make(torrent, sock)
+}
+
+def connect_to_first_peer_udp(torrent: &Torrent): Peer {
+    let announce = SV::from_str(torrent.announce)
+
+    let protocol = announce.chop_by_str("://")
+    let tracker_host = announce.chop_by_delim(':')
+    let tracker_port = announce.chop_i64() as i32
+
+    println(f"[+] Connecting to UDP tracker: {tracker_host}:{tracker_port}")
+
+    let socket = Socket::connect(`{tracker_host}`, tracker_port, UDP)
+    let transaction_id = 0x420
+    let connection_id = 0u64
+
+    { // Connect Message
+        let msg = Buffer::make()
+        defer msg.free()
+
+        msg.write_u64(0x41727101980)
+        msg.write_u32(0)
+        msg.write_u32(transaction_id)
+        socket.write(&msg)
+    }
+    { // Connection response
+        let response = Buffer::make()
+        defer response.free()
+        socket.read_exactly(&response, 16)
+
+        let io = response.reader()
+        let action = io.read_u32()
+        let txn_id = io.read_u32()
+        let cxn_id = io.read_u64()
+        println(f"[+] Action={action}, Transaction ID={txn_id}, Connection ID={cxn_id}")
+
+        if action != 0 and transaction_id != txn_id {
+            println(`[+] Invalid response from tracker`)
+            std::exit(1)
+        }
+        connection_id = cxn_id
+    }
+    { // Announcing
+        let msg = Buffer::make()
+        defer msg.free()
+
+        msg.write_u64(connection_id)
+        msg.write_u32(1)
+        msg.write_u32(transaction_id)
+        msg.write_bytes(torrent.info_hash.data, 20)
+        msg.write_bytes("01234567890123456789", 20)
+        msg.write_i64(0)                 // Downloaded
+        msg.write_i64(torrent.file_size) // Left
+        msg.write_i64(0)                 // Uploaded
+        msg.write_i32(0)                 // Event
+        msg.write_u32(0)                 // IP address (0 = default)
+        msg.write_u32(69)                // Key
+        msg.write_i32(-1)                // Number of peers wanted (-1 = default)
+        msg.write_u16(6881)              // Port
+        msg.write_u16(0)                 // Extensions
+        socket.write(&msg)
+    }
+
+    let sock: Socket
+    { // Response to announcing
+        let response = Buffer::make()
+        defer response.free()
+
+        let header_size = 20
+        let n = socket.read(&response, 1024)
+        let num_peers = (n - header_size) / 6
+
+        let io = response.reader()
+        let action = io.read_i32()
+        let transaction_id = io.read_i32()
+        let interval = io.read_i32()
+        let leechers = io.read_i32()
+        let seeders = io.read_i32()
+
+        let peers = io.read_bytes_sv(n - header_size)
+        println(f"[+] Found {peers.len / 6} Peers")
+        let found_peer = false
+        for let i = 66; i < peers.len; i += 6 {
+            let ip = peers.slice(i+0, i+4)
+            let peer_port = peers.slice(i+4, i+6)
+            let port_number = (peer_port.data[0] as u8 as u32 << 8) + peer_port.data[1] as u8 as u32
+
+            if not found_peer {
+                let peer_ip = f"{ip.data[0] as u8}.{ip.data[1] as u8}.{ip.data[2] as u8}.{ip.data[3] as u8}"
+                let peer_port = port_number
+                print(f"[+] Trying to connect to peer: {peer_ip}:{peer_port} ... ")
+                let res = Socket::try_connect(peer_ip, peer_port as i32, TCP, &sock, timeout_secs: 1)
+                if res == Ok {
+                    println("Connected!")
+                    found_peer = true
+                } else {
+                    println("Failed.")
+                    continue
+                }
+            }
+        }
+    }
+
+    return Peer::make(torrent, sock)
+}
+
+def connect_to_first_peer(torrent: &Torrent): Peer {
+    if torrent.announce.starts_with("http") return connect_to_first_peer_tcp(torrent)
+    if torrent.announce.starts_with("udp") return connect_to_first_peer_udp(torrent)
+    std::panic(`Unsupported protocol for tracker: {torrent.announce}`)
+}
+
+def download_piece(torrent: &Torrent, peer: &Peer, piece: u32) {
+
+    let requested_chunks = 0
+    let piece_size = if piece == torrent.num_pieces - 1 {
+        yield (torrent.file_size % torrent.piece_size) as u32
+    } else {
+        yield torrent.piece_size as u32
+    }
+    for let offset = 0; offset < piece_size; offset += CHUNK_SIZE {
+        let cur_chunk_size = if offset + CHUNK_SIZE > piece_size {
+            yield piece_size - offset
+        } else {
+            yield CHUNK_SIZE
+        }
+
+        let payload = Buffer::make()
+        payload.write_u32(piece)
+        payload.write_u32(offset)
+        payload.write_u32(cur_chunk_size)
+
+        let message = Message(Request, payload)
+        peer.send_message(message)
+        message.free()
+        requested_chunks++
+    }
+
+    let piece_data = Buffer::make(capacity: piece_size)
+    piece_data.size = piece_size
+
+    let received_chunks = 0
+    while received_chunks < requested_chunks {
+        let message = peer.get_message()
+        match message.type {
+            Piece => {
+                let chunk = Chunk::make(&message.payload)
+                memcpy(
+                    dest: piece_data.data + chunk.offset,
+                    src: chunk.data.data,
+                    size: chunk.data.len
+                )
+                received_chunks++
+            }
+            Choke => {
+                println("[-] Got Choke message while waiting for piece data, sending Interested ...")
+                for let i = 0; i < 10; i++ {
+                    let msg = Message::make(Interested)
+                    peer.send_message(msg)
+                    msg.free()
+                }
+            }
+            else => println(f"[-] Got {message.type} message while waiting for piece data")
+        }
+        message.free()
+    }
+
+    let piece_hash = SHA1Hash::from(piece_data)
+    if not piece_hash.eq(torrent.piece_hashes.at(piece)) {
+        println(f"[-] Piece {piece} hash mismatch!!")
+    }
+    peer.file.seek(piece as i64 * torrent.piece_size, Set)
+    peer.file.write(piece_data.data, piece_data.size)
+}
+
+
+def main(argc: i32, argv: &str) {
+    if argc < 2 {
+        println(f"Usage: {argv[0]} <torrent file>")
+        std::exit(1)
+    }
+
+    let torrent = parse_torrent_file(argv[1])
+
+    println(f"Torrent file name: {torrent.file_name}")
+    println(f"Length: {torrent.file_size}")
+    println(f"Piece size: {torrent.piece_size}")
+    println(f"Pieces: {torrent.num_pieces}")
+    print("Info hash:"); torrent.info_hash.hex_dump()
+
+    println("Piece hashes:")
+    for piece_hash : torrent.piece_hashes.iter() {
+        print("  => ");
+        piece_hash.hex_dump()
+    }
+
+    let peer = connect_to_first_peer(&torrent)
+    peer.perform_handshake()
+
+    {
+        let msg = peer.get_message()
+        println(f"[+] First Received message of type {msg.type}")
+        msg.free()
+    }
+    {
+        let msg = Message::make(Interested)
+        peer.send_message(msg)
+        msg.free()
+    }
+    while peer.is_choked {
+        let msg = peer.get_message()
+        println(f"[+] Received message of type {msg.type}")
+        msg.free()
+    }
+    println(f"[+] Unchoked! Number of pieces available: {peer.pieces_available.size}")
+
+    peer.file = fs::File::open(torrent.file_name, "wb")
+    peer.file.truncate(torrent.file_size)
+
+    while peer.downloaded_pieces.size < torrent.num_pieces {
+        if peer.pieces_available.size == 0 {
+            println("[-] No more pieces available, waiting for messages ...")
+            let msg = peer.get_message()
+            msg.free()
+            continue
+        }
+
+
+        let piece = peer.pieces_available.pop()
+        if peer.downloaded_pieces.contains(piece) continue
+
+        download_piece(&torrent, &peer, piece)
+        peer.downloaded_pieces.add(piece)
+
+        let pct = peer.downloaded_pieces.size as f32 * 100.0 / torrent.num_pieces as f32
+        println(`[+] Downloaded piece {piece} ({peer.downloaded_pieces.size}/{torrent.num_pieces}, {pct:.2f}% done)`)
+    }
+}
